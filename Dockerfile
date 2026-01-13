@@ -8,7 +8,7 @@ COPY ./ /go/src/github.com/bevelgacom/wapipedia
 
 WORKDIR /go/src/github.com/bevelgacom/wapipedia
 
-RUN go build -o wapipedia ./
+RUN go build -o wapipedia ./cmd/wapipedia
 
 FROM alpine:edge
 
