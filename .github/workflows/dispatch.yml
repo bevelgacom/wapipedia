@@ -1,0 +1,72 @@
+name: Docker Deploy
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            arch: amd64
+          - os: ubuntu-24.04-arm
+            arch: arm64
+    permissions:
+      contents: read
+      packages: write
+    steps:
+    - uses: actions/checkout@v2
+    - name: Install buildx
+      run: |
+          sudo apt-get update
+          mkdir -p ~/.docker/cli-plugins
+          BUILDX_URL=$(curl https://api.github.com/repos/docker/buildx/releases/latest | jq -r .assets[].browser_download_url | grep ${{ matrix.arch }} | grep linux)
+          wget $BUILDX_URL -O ~/.docker/cli-plugins/docker-buildx
+          chmod +x ~/.docker/cli-plugins/docker-buildx
+          docker buildx create --name xbuilder
+          docker buildx use xbuilder
+          docker buildx inspect --bootstrap
+    - name: Log in to GitHub Container Registry
+      run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+    - name: Build and push the Docker image
+      run: docker buildx build --provenance false -t ghcr.io/${{ github.repository }}/wapipedia:$GITHUB_SHA-${{ matrix.arch }} --push --platform "linux/${{ matrix.arch }}" .
+
+  build-merge:
+    runs-on: ubuntu-latest
+    needs: build
+    permissions:
+      contents: read
+      packages: write
+    steps:
+    - uses: actions/checkout@v2
+    - name: Log in to GitHub Container Registry
+      run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+    # Merge the multi-arch images into a single manifest
+    - name: Merge multi-arch images
+      run: |
+        docker pull --platform linux/amd64 ghcr.io/${{ github.repository }}/wapipedia:$GITHUB_SHA-amd64
+        docker pull --platform linux/arm64 ghcr.io/${{ github.repository }}/wapipedia:$GITHUB_SHA-arm64
+        docker manifest create ghcr.io/${{ github.repository }}/wapipedia:$GITHUB_SHA --amend ghcr.io/${{ github.repository }}/wapipedia:$GITHUB_SHA-amd64 --amend ghcr.io/${{ github.repository }}/wapipedia:$GITHUB_SHA-arm64
+        docker manifest annotate ghcr.io/${{ github.repository }}/wapipedia:$GITHUB_SHA ghcr.io/${{ github.repository }}/wapipedia:$GITHUB_SHA-amd64 --os linux --arch amd64
+        docker manifest annotate ghcr.io/${{ github.repository }}/wapipedia:$GITHUB_SHA ghcr.io/${{ github.repository }}/wapipedia:$GITHUB_SHA-arm64 --os linux --arch arm64
+        docker manifest push ghcr.io/${{ github.repository }}/wapipedia:$GITHUB_SHA
+    
+  deploy:
+    runs-on: self-hosted
+    permissions:
+      contents: read
+      packages: read
+    needs: build-merge
+    steps:
+    - name: Log in to GitHub Container Registry
+      run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+    - name: Pull and run the Docker image
+      run: |
+        docker kill wapipedia || true
+        docker rm wapipedia || true
+        docker pull ghcr.io/${{ github.repository }}/wapipedia:$GITHUB_SHA
+        docker run -d --restart=always --name wapipedia -v /mnt/wapipedia:/data -p 8040:8080 ghcr.io/${{ github.repository }}/wapipedia:$GITHUB_SHA
+        docker system prune -f -a

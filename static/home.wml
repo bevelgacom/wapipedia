@@ -1,0 +1,31 @@
+<?xml version="1.0"?>
+<!DOCTYPE wml PUBLIC "-//WAPFORUM//DTD WML 1.1//EN" "http://www.wapforum.org/DTD/wml_1.1.xml">
+
+<wml>
+<card id="home" title="Wapipedia">
+<p align="center">
+<b>Wapipedia</b><br/>
+Wikipedia for WAP
+</p>
+
+<p>
+<b>Search:</b><br/>
+<input name="q" title="Search" maxlength="50"/>
+<anchor>
+Search
+<go href="/search" method="get">
+<postfield name="q" value="$(q)"/>
+</go>
+</anchor>
+</p>
+
+<p>
+<a href="/article?id={{ .RandomID }}">Random Article</a>
+</p>
+
+<p>
+<small>{{ .ArticleCount }} articles</small>
+</p>
+
+</card>
+</wml>

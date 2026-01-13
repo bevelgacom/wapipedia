@@ -1,0 +1,31 @@
+<?xml version="1.0"?>
+<!DOCTYPE wml PUBLIC "-//WAPFORUM//DTD WML 1.1//EN" "http://www.wapforum.org/DTD/wml_1.1.xml">
+
+<wml>
+<card id="article" title="{{ .Title }}">
+<p>
+<b>{{ .Title }}</b>
+{{- if .HasInfobox }}
+<br/>[<a href="/infobox?id={{ .Index }}">Infobox</a>]
+{{- end }}
+</p>
+
+<p>
+{{ .Content }}
+</p>
+
+{{- if .ShowMore }}
+<do type="accept" label="&gt; More">
+<go href="/article?id={{ .Index }}&amp;p={{ .NextPage }}"/>
+</do>
+{{- end }}
+
+<do type="prev" label="Back">
+<prev/>
+</do>
+
+<do type="options" label="Home">
+<go href="/"/>
+</do>
+</card>
+</wml>

@@ -1,0 +1,47 @@
+<?xml version="1.0"?>
+<!DOCTYPE wml PUBLIC "-//WAPFORUM//DTD WML 1.1//EN" "http://www.wapforum.org/DTD/wml_1.1.xml">
+
+<wml>
+<card id="search" title="Search Results">
+<p>
+<b>Search:</b> {{ .Query }}
+</p>
+
+{{- if .Results }}
+{{- range .Results}}
+<p>
+<a href="/article?id={{ .Index }}">{{ .Title }}</a>
+</p>
+{{- end }}
+
+{{- if .ShowMore }}
+<p>
+<a href="/search?q={{ .QueryEncoded }}&amp;o={{ .NextOffset }}">More results...</a>
+</p>
+{{- end }}
+{{- else }}
+<p>
+No results found for "{{ .Query }}"
+</p>
+{{- end }}
+
+<p>
+<b>New search:</b><br/>
+<input name="q" title="Search" value="{{ .Query }}" maxlength="50"/>
+<anchor>
+Search
+<go href="/search" method="get">
+<postfield name="q" value="$(q)"/>
+</go>
+</anchor>
+</p>
+
+<do type="prev" label="Back">
+<prev/>
+</do>
+
+<do type="accept" label="Home">
+<go href="/"/>
+</do>
+</card>
+</wml>
