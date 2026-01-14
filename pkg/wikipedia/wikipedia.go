@@ -375,6 +375,19 @@ func cleanCellContent(content string) string {
 
 // GetRandomArticle returns a random article
 func (w *Wikipedia) GetRandomArticle() (*Article, error) {
+	// If search index is available, use it for efficient random selection
+	// The index only contains valid articles (no redirects, resources, etc.)
+	if w.blugeIndex != nil {
+		idx, err := w.blugeIndex.GetRandomArticleIndex()
+		if err == nil {
+			return w.GetArticle(idx)
+		}
+		// Fall through to legacy method if index lookup fails
+	}
+
+	fmt.Println("Falling back to random article from ZIM")
+
+	// Legacy method: randomly sample from ZIM file entries
 	articleCount := w.reader.GetArticleCount()
 	if articleCount == 0 {
 		return nil, errors.New("no articles available")
@@ -443,17 +456,6 @@ func min(a, b int) int {
 		return a
 	}
 	return b
-}
-
-// GetArticleCount returns the number of articles from the search index
-// If index not loaded, returns an estimate based on ZIM header
-func (w *Wikipedia) GetArticleCount() uint32 {
-	if w.articleCount > 0 {
-		return w.articleCount
-	}
-	// Return ZIM header count as estimate (includes all entries, not just articles)
-	// Typical Wikipedia ZIM files have ~50% actual articles
-	return w.reader.GetArticleCount() / 2
 }
 
 // HTMLToWML converts HTML content to WML-safe plain text (no tables)

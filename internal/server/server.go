@@ -7,6 +7,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"text/template"
 
 	image "github.com/bevelgacom/wapipedia/pkg/wbmp"
@@ -16,6 +17,15 @@ import (
 
 // Global Wikipedia instance
 var wiki *wikipedia.Wikipedia
+
+// Random ID cache
+const randomIDCacheSize = 100
+
+var (
+	randomIDCache  []uint32
+	randomIDMutex  sync.Mutex
+	randomIDRefill chan struct{}
+)
 
 // WikiHome represents the home page data
 type WikiHome struct {
@@ -68,7 +78,71 @@ func InitWikipedia(zimPath string) error {
 	// Set global wiki reference for image ID lookups during HTML conversion
 	wikipedia.SetGlobalWiki(wiki)
 
+	// Initialize random ID cache
+	initRandomIDCache()
+
 	return nil
+}
+
+// initRandomIDCache initializes the random ID cache and starts the background refill goroutine
+func initRandomIDCache() {
+	randomIDCache = make([]uint32, 0, randomIDCacheSize)
+	randomIDRefill = make(chan struct{}, randomIDCacheSize)
+
+	// Pre-fill the cache
+	go fillRandomIDCache(randomIDCacheSize)
+
+	// Start background refill goroutine
+	go randomIDRefillWorker()
+}
+
+// fillRandomIDCache fills the cache with random article IDs
+func fillRandomIDCache(count int) {
+	for i := 0; i < count; i++ {
+		if article, err := wiki.GetRandomArticle(); err == nil {
+			randomIDMutex.Lock()
+			if len(randomIDCache) < randomIDCacheSize {
+				randomIDCache = append(randomIDCache, article.Index)
+			}
+			randomIDMutex.Unlock()
+		}
+	}
+}
+
+// randomIDRefillWorker is a background goroutine that refills the cache when signaled
+func randomIDRefillWorker() {
+	for range randomIDRefill {
+		randomIDMutex.Lock()
+		needCount := randomIDCacheSize - len(randomIDCache)
+		randomIDMutex.Unlock()
+
+		if needCount > 0 {
+			fillRandomIDCache(needCount)
+		}
+	}
+}
+
+// getRandomIDFromCache returns a random ID from the cache and triggers a refill
+func getRandomIDFromCache() (uint32, bool) {
+	randomIDMutex.Lock()
+	defer randomIDMutex.Unlock()
+
+	if len(randomIDCache) == 0 {
+		return 0, false
+	}
+
+	// Pop the last ID from the cache
+	id := randomIDCache[len(randomIDCache)-1]
+	randomIDCache = randomIDCache[:len(randomIDCache)-1]
+
+	// Signal the refill goroutine (non-blocking)
+	select {
+	case randomIDRefill <- struct{}{}:
+	default:
+		// Channel is full, refill already pending
+	}
+
+	return id, true
 }
 
 // serveWikiHome serves the Wikipedia home page
@@ -77,15 +151,17 @@ func serveWikiHome(c echo.Context) error {
 		return serveWikiError(c, "Not Available", "Wikipedia data is not loaded. Please download a Wikipedia dump first.")
 	}
 
-	// Get a random article ID for the random link
+	// Get a random article ID from the cache
 	randomID := uint32(0)
-	if article, err := wiki.GetRandomArticle(); err == nil {
+	if id, ok := getRandomIDFromCache(); ok {
+		randomID = id
+	} else if article, err := wiki.GetRandomArticle(); err == nil {
+		// Fallback if cache is empty
 		randomID = article.Index
 	}
 
 	data := WikiHome{
-		ArticleCount: wiki.GetArticleCount(),
-		RandomID:     randomID,
+		RandomID: randomID,
 	}
 
 	tmpl := template.Must(template.ParseFiles("./static/home.wml"))

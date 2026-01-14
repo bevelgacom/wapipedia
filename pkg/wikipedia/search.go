@@ -2,6 +2,8 @@ package wikipedia
 
 import (
 	"context"
+	cryptorand "crypto/rand"
+	"encoding/binary"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -358,4 +360,73 @@ func (b *BlugeIndex) GetDocumentCount() (uint64, error) {
 	}
 
 	return docMatches.Aggregations().Count(), nil
+}
+
+// GetRandomArticleIndex returns a random article index from the search index
+func (b *BlugeIndex) GetRandomArticleIndex() (uint32, error) {
+	ctx := context.Background()
+
+	// Get total document count
+	count, err := b.GetDocumentCount()
+	if err != nil {
+		return 0, fmt.Errorf("failed to get document count: %w", err)
+	}
+	if count == 0 {
+		return 0, fmt.Errorf("no articles in index")
+	}
+
+	// Pick a random offset using crypto/rand (no seeding required)
+	var buf [8]byte
+	if _, err := cryptorand.Read(buf[:]); err != nil {
+		return 0, fmt.Errorf("failed to generate random number: %w", err)
+	}
+	offset := int(binary.LittleEndian.Uint64(buf[:]) % count)
+
+	// Use match all query with the random offset
+	query := bluge.NewMatchAllQuery()
+	searchReq := bluge.NewTopNSearch(offset+1, query)
+
+	docMatches, err := b.reader.Search(ctx, searchReq)
+	if err != nil {
+		return 0, fmt.Errorf("search failed: %w", err)
+	}
+
+	// Skip to the random offset and get the match at that position
+	docMatch, err := docMatches.Next()
+	for i := 0; i < offset && err == nil && docMatch != nil; i++ {
+		docMatch, err = docMatches.Next()
+	}
+	if err != nil {
+		return 0, fmt.Errorf("error iterating to offset: %w", err)
+	}
+	if docMatch == nil {
+		return 0, fmt.Errorf("unexpected end of results at offset %d", offset)
+	}
+
+	// Extract the article index from the match
+	var articleIdx uint32
+	var found bool
+	err = docMatch.VisitStoredFields(func(field string, value []byte) bool {
+		if field == "idx" {
+			if num, err := bluge.DecodeNumericFloat64(value); err == nil {
+				articleIdx = uint32(num)
+				found = true
+			}
+		} else if field == "_id" && !found {
+			// Fallback: document ID is the index as string
+			if idx, err := strconv.ParseUint(string(value), 10, 32); err == nil {
+				articleIdx = uint32(idx)
+				found = true
+			}
+		}
+		return true
+	})
+	if err != nil {
+		return 0, fmt.Errorf("error reading stored fields: %w", err)
+	}
+	if !found {
+		return 0, fmt.Errorf("article index not found in document")
+	}
+
+	return articleIdx, nil
 }

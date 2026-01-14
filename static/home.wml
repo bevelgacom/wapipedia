@@ -24,10 +24,6 @@ Search
 </p>
 
 <p>
-<small>{{ .ArticleCount }} articles</small>
-</p>
-
-<p>
 <small><i>Wikipedia is available under the Creative Commons Attribution-ShareAlike 4.0 License; Wikipedia is a registered trademark of the Wikimedia Foundation, Inc., a non-profit organization. WAPipedia is a hobby project by Bevelgacom a Retro ISP and is not affiliated with the Wikimedia Foundation.</i></small>
 </p>
 
