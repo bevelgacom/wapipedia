@@ -7,10 +7,7 @@ import (
 	"math/rand"
 	"net/url"
 	"regexp"
-	"sort"
 	"strings"
-	"sync"
-	"unicode"
 )
 
 // Article represents a Wikipedia article
@@ -38,10 +35,8 @@ type SearchResult struct {
 type Wikipedia struct {
 	zimPath      string
 	reader       *ZIMReader
-	titleIndex   map[string][]uint32 // lowercase title -> article indices
-	articleCount uint32              // count of actual articles (not resources)
-	mu           sync.RWMutex
-	indexBuilt   bool
+	blugeIndex   *BlugeIndex // persistent Bluge search index
+	articleCount uint32      // count of actual articles
 }
 
 // NewWikipedia creates a new Wikipedia instance
@@ -52,9 +47,36 @@ func NewWikipedia(zimPath string) (*Wikipedia, error) {
 	}
 
 	w := &Wikipedia{
-		zimPath:    zimPath,
-		reader:     reader,
-		titleIndex: make(map[string][]uint32),
+		zimPath: zimPath,
+		reader:  reader,
+	}
+
+	return w, nil
+}
+
+// NewWikipediaWithIndex creates a new Wikipedia instance and loads the Bluge index
+func NewWikipediaWithIndex(zimPath, indexPath string) (*Wikipedia, error) {
+	w, err := NewWikipedia(zimPath)
+	if err != nil {
+		return nil, err
+	}
+
+	// Try to load Bluge index
+	if indexPath == "" {
+		indexPath = DefaultIndexPath(zimPath)
+	}
+
+	blugeIndex, err := LoadBlugeIndex(indexPath)
+	if err != nil {
+		// Index not available, search won't work
+		fmt.Printf("Warning: Search index not found at %s\n", indexPath)
+		fmt.Printf("Run 'wapipedia index -z %s' to build the search index.\n", zimPath)
+	} else {
+		w.blugeIndex = blugeIndex
+		if count, err := blugeIndex.GetDocumentCount(); err == nil {
+			w.articleCount = uint32(count)
+			fmt.Printf("Loaded search index with %d articles\n", count)
+		}
 	}
 
 	return w, nil
@@ -62,172 +84,21 @@ func NewWikipedia(zimPath string) (*Wikipedia, error) {
 
 // Close closes the Wikipedia reader
 func (w *Wikipedia) Close() error {
+	if w.blugeIndex != nil {
+		w.blugeIndex.Close()
+	}
 	if w.reader != nil {
 		return w.reader.Close()
 	}
 	return nil
 }
 
-// BuildIndex builds a search index for fast lookups
-func (w *Wikipedia) BuildIndex() error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-
-	if w.indexBuilt {
-		return nil
-	}
-
-	entryCount := w.reader.GetArticleCount()
-	var articleCount uint32 = 0
-
-	// Index articles by title for search
-	for i := uint32(0); i < entryCount; i++ {
-		entry, err := w.reader.GetDirectoryEntry(i)
-		if err != nil {
-			continue
-		}
-
-		// Only index articles (namespace 'A' or 'C')
-		if entry.Namespace != 'A' && entry.Namespace != 'C' {
-			continue
-		}
-
-		// Skip redirects for primary indexing
-		if entry.IsRedirect {
-			continue
-		}
-
-		// Skip resource files
-		url := strings.ToLower(entry.URL)
-		if strings.HasSuffix(url, ".css") || strings.HasSuffix(url, ".js") ||
-			strings.HasSuffix(url, ".png") || strings.HasSuffix(url, ".jpg") ||
-			strings.HasSuffix(url, ".jpeg") || strings.HasSuffix(url, ".gif") ||
-			strings.HasSuffix(url, ".svg") || strings.HasSuffix(url, ".ico") ||
-			strings.HasSuffix(url, ".woff") || strings.HasSuffix(url, ".woff2") ||
-			strings.HasSuffix(url, ".ttf") || strings.HasSuffix(url, ".eot") ||
-			strings.Contains(url, "/-/") {
-			continue
-		}
-
-		articleCount++
-
-		title := strings.ToLower(entry.Title)
-		words := tokenize(title)
-
-		for _, word := range words {
-			w.titleIndex[word] = append(w.titleIndex[word], i)
-		}
-	}
-
-	w.articleCount = articleCount
-	w.indexBuilt = true
-	return nil
-}
-
-// tokenize splits text into searchable tokens
-func tokenize(text string) []string {
-	text = strings.ToLower(text)
-	var tokens []string
-	var current strings.Builder
-
-	for _, r := range text {
-		if unicode.IsLetter(r) || unicode.IsDigit(r) {
-			current.WriteRune(r)
-		} else if current.Len() > 0 {
-			tokens = append(tokens, current.String())
-			current.Reset()
-		}
-	}
-
-	if current.Len() > 0 {
-		tokens = append(tokens, current.String())
-	}
-
-	return tokens
-}
-
-// Search searches for articles matching the query
+// Search searches for articles matching the query using Bluge index
 func (w *Wikipedia) Search(query string, maxResults int) ([]SearchResult, error) {
-	if !w.indexBuilt {
-		if err := w.BuildIndex(); err != nil {
-			return nil, err
-		}
+	if w.blugeIndex == nil {
+		return nil, errors.New("search index not loaded - run 'wapipedia index' first")
 	}
-
-	w.mu.RLock()
-	defer w.mu.RUnlock()
-
-	query = strings.ToLower(strings.TrimSpace(query))
-	if query == "" {
-		return nil, nil
-	}
-
-	queryTokens := tokenize(query)
-	if len(queryTokens) == 0 {
-		return nil, nil
-	}
-
-	// Score articles based on matching tokens
-	scores := make(map[uint32]float64)
-
-	for _, token := range queryTokens {
-		// Exact matches
-		if indices, ok := w.titleIndex[token]; ok {
-			for _, idx := range indices {
-				scores[idx] += 10.0
-			}
-		}
-
-		// Prefix matches
-		for word, indices := range w.titleIndex {
-			if strings.HasPrefix(word, token) {
-				for _, idx := range indices {
-					scores[idx] += 5.0
-				}
-			}
-		}
-	}
-
-	// Boost exact title matches
-	for idx := range scores {
-		entry, err := w.reader.GetDirectoryEntry(idx)
-		if err != nil {
-			continue
-		}
-
-		entryTitle := strings.ToLower(entry.Title)
-		if entryTitle == query {
-			scores[idx] += 100.0
-		} else if strings.HasPrefix(entryTitle, query) {
-			scores[idx] += 20.0
-		}
-	}
-
-	// Convert to results and sort
-	results := make([]SearchResult, 0, len(scores))
-	for idx, score := range scores {
-		entry, err := w.reader.GetDirectoryEntry(idx)
-		if err != nil {
-			continue
-		}
-
-		results = append(results, SearchResult{
-			Index: idx,
-			URL:   entry.URL,
-			Title: entry.Title,
-			Score: score,
-		})
-	}
-
-	sort.Slice(results, func(i, j int) bool {
-		return results[i].Score > results[j].Score
-	})
-
-	if maxResults > 0 && len(results) > maxResults {
-		results = results[:maxResults]
-	}
-
-	return results, nil
+	return w.blugeIndex.Search(query, maxResults)
 }
 
 // GetArticle retrieves an article by its index
@@ -574,12 +445,15 @@ func min(a, b int) int {
 	return b
 }
 
-// GetArticleCount returns the number of actual articles (not resources)
+// GetArticleCount returns the number of articles from the search index
+// If index not loaded, returns an estimate based on ZIM header
 func (w *Wikipedia) GetArticleCount() uint32 {
-	if !w.indexBuilt {
-		w.BuildIndex()
+	if w.articleCount > 0 {
+		return w.articleCount
 	}
-	return w.articleCount
+	// Return ZIM header count as estimate (includes all entries, not just articles)
+	// Typical Wikipedia ZIM files have ~50% actual articles
+	return w.reader.GetArticleCount() / 2
 }
 
 // HTMLToWML converts HTML content to WML-safe plain text (no tables)

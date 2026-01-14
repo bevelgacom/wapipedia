@@ -56,26 +56,17 @@ type WikiError struct {
 	Message string
 }
 
-// InitWikipedia initializes the Wikipedia reader
+// InitWikipedia initializes the Wikipedia reader with optional pre-built search index
 func InitWikipedia(zimPath string) error {
 	var err error
-	wiki, err = wikipedia.NewWikipedia(zimPath)
+	// Use NewWikipediaWithIndex to load pre-built Bluge index if available
+	wiki, err = wikipedia.NewWikipediaWithIndex(zimPath, "")
 	if err != nil {
 		return err
 	}
 
 	// Set global wiki reference for image ID lookups during HTML conversion
 	wikipedia.SetGlobalWiki(wiki)
-
-	// Build index in background
-	go func() {
-		log.Println("Building Wikipedia search index...")
-		if err := wiki.BuildIndex(); err != nil {
-			log.Printf("Warning: Failed to build search index: %v", err)
-		} else {
-			log.Println("Wikipedia search index built successfully")
-		}
-	}()
 
 	return nil
 }
