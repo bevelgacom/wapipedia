@@ -28,5 +28,5 @@ ENV WAPIPEDIA_ZIM=/data/wikipedia.zim
 
 EXPOSE 8080
 
-ENTRYPOINT [ "wapipedia", "serve" ]
+ENTRYPOINT [ "wapipedia", "serve", "--low-memory" ]
 

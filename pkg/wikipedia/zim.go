@@ -7,13 +7,88 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
+	"runtime"
 	"strings"
 	"sync"
 
 	"github.com/klauspost/compress/zstd"
 	"github.com/ulikunitz/xz"
 )
+
+// Memory optimization: pool for zstd decoders to reduce allocations
+var zstdDecoderPool = sync.Pool{
+	New: func() interface{} {
+		decoder, err := zstd.NewReader(nil, zstd.WithDecoderConcurrency(1), zstd.WithDecoderLowmem(true))
+		if err != nil {
+			return nil
+		}
+		return decoder
+	},
+}
+
+// clusterCacheEntry represents a cached decompressed cluster
+type clusterCacheEntry struct {
+	data []byte
+}
+
+// clusterCache is a simple LRU-like cache for decompressed clusters
+type clusterCache struct {
+	mu      sync.RWMutex
+	entries map[uint32]*clusterCacheEntry
+	order   []uint32 // LRU order (most recent at end)
+	maxSize int      // max number of entries
+}
+
+func newClusterCache(maxSize int) *clusterCache {
+	return &clusterCache{
+		entries: make(map[uint32]*clusterCacheEntry),
+		order:   make([]uint32, 0, maxSize),
+		maxSize: maxSize,
+	}
+}
+
+func (c *clusterCache) get(clusterNum uint32) ([]byte, bool) {
+	c.mu.RLock()
+	entry, ok := c.entries[clusterNum]
+	c.mu.RUnlock()
+	if !ok {
+		return nil, false
+	}
+	// Move to end of order (most recently used)
+	c.mu.Lock()
+	for i, num := range c.order {
+		if num == clusterNum {
+			c.order = append(c.order[:i], c.order[i+1:]...)
+			c.order = append(c.order, clusterNum)
+			break
+		}
+	}
+	c.mu.Unlock()
+	return entry.data, true
+}
+
+func (c *clusterCache) put(clusterNum uint32, data []byte) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// Already exists
+	if _, ok := c.entries[clusterNum]; ok {
+		return
+	}
+
+	// Evict oldest if full
+	for len(c.entries) >= c.maxSize && len(c.order) > 0 {
+		oldest := c.order[0]
+		c.order = c.order[1:]
+		delete(c.entries, oldest)
+		log.Printf("Evicted cluster %d from cache", oldest)
+	}
+
+	c.entries[clusterNum] = &clusterCacheEntry{data: data}
+	c.order = append(c.order, clusterNum)
+}
 
 // ZIM file format constants
 const (
@@ -53,23 +128,44 @@ type DirectoryEntry struct {
 
 // ZIMReader handles reading ZIM files
 type ZIMReader struct {
-	file        *os.File
-	header      ZIMHeader
-	mimeTypes   []string
-	urlPtrs     []uint64
-	titlePtrs   []uint32
-	clusterPtrs []uint64
-	mu          sync.RWMutex
+	file          *os.File
+	header        ZIMHeader
+	mimeTypes     []string
+	urlPtrs       []uint64
+	titlePtrs     []uint32
+	clusterPtrs   []uint64
+	mu            sync.RWMutex
+	clusterCache  *clusterCache // LRU cache for decompressed clusters
+	lowMemoryMode bool          // Whether to use low-memory optimizations
 }
 
 // NewZIMReader creates a new ZIM file reader
 func NewZIMReader(filepath string) (*ZIMReader, error) {
+	return NewZIMReaderWithOptions(filepath, true)
+}
+
+// NewZIMReaderWithOptions creates a new ZIM file reader with memory optimization options
+func NewZIMReaderWithOptions(filepath string, lowMemoryMode bool) (*ZIMReader, error) {
+	log.Printf("Opening ZIM file: %s (low memory mode: %v)", filepath, lowMemoryMode)
+
 	file, err := os.Open(filepath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open ZIM file: %w", err)
 	}
 
-	reader := &ZIMReader{file: file}
+	// Determine cache size based on available memory
+	// Use smaller cache in low memory mode
+	cacheSize := 50
+	if lowMemoryMode {
+		cacheSize = 10 // Much smaller cache for 512MB systems
+	}
+	//log.Printf("Cluster cache size: %d entries", cacheSize)
+
+	reader := &ZIMReader{
+		file:          file,
+		clusterCache:  newClusterCache(cacheSize),
+		lowMemoryMode: lowMemoryMode,
+	}
 	if err := reader.readHeader(); err != nil {
 		file.Close()
 		return nil, err
@@ -90,6 +186,13 @@ func NewZIMReader(filepath string) (*ZIMReader, error) {
 		return nil, err
 	}
 
+	// Force GC after loading pointers to free any temporary allocations
+	if lowMemoryMode {
+		log.Println("Running GC after ZIM initialization")
+		runtime.GC()
+	}
+
+	log.Printf("ZIM file loaded: %d articles, %d clusters", reader.header.ArticleCount, reader.header.ClusterCount)
 	return reader, nil
 }
 
@@ -282,6 +385,12 @@ func (z *ZIMReader) GetBlob(clusterNum, blobNum uint32) ([]byte, error) {
 		return nil, errors.New("cluster index out of range")
 	}
 
+	// Check cluster cache first
+	if cachedData, ok := z.clusterCache.get(clusterNum); ok {
+		//log.Printf("Cluster %d cache hit", clusterNum)
+		return z.extractBlobFromCluster(cachedData, blobNum)
+	}
+
 	z.mu.RLock()
 	clusterPtr := z.clusterPtrs[clusterNum]
 	var nextClusterPtr uint64
@@ -308,6 +417,8 @@ func (z *ZIMReader) GetBlob(clusterNum, blobNum uint32) ([]byte, error) {
 	compression := clusterInfo[0] & 0x0F
 
 	clusterSize := int64(nextClusterPtr - clusterPtr - 1)
+	//log.Printf("Reading cluster %d: compression=%d, size=%d bytes", clusterNum, compression, clusterSize)
+
 	compressedData := make([]byte, clusterSize)
 	if _, err := io.ReadFull(z.file, compressedData); err != nil {
 		return nil, err
@@ -330,14 +441,9 @@ func (z *ZIMReader) GetBlob(clusterNum, blobNum uint32) ([]byte, error) {
 		reader, err := xz.NewReader(bytes.NewReader(compressedData))
 		if err != nil {
 			// Try zstd as fallback (some ZIM files mislabel compression)
-			decoder, zstdErr := zstd.NewReader(bytes.NewReader(compressedData))
-			if zstdErr != nil {
-				return nil, fmt.Errorf("failed to create XZ reader: %w (zstd fallback also failed: %v)", err, zstdErr)
-			}
-			clusterData, err = io.ReadAll(decoder)
-			decoder.Close()
+			clusterData, err = z.decompressZstdPooled(compressedData)
 			if err != nil {
-				return nil, fmt.Errorf("failed to decompress with zstd fallback: %w", err)
+				return nil, fmt.Errorf("failed to create XZ reader (zstd fallback also failed: %v)", err)
 			}
 		} else {
 			clusterData, err = io.ReadAll(reader)
@@ -345,55 +451,24 @@ func (z *ZIMReader) GetBlob(clusterNum, blobNum uint32) ([]byte, error) {
 				return nil, fmt.Errorf("failed to decompress XZ cluster: %w", err)
 			}
 		}
-	case 6: // zstd
-		decoder, err := zstd.NewReader(bytes.NewReader(compressedData))
+	case 6: // zstd - use pooled decoder for memory efficiency
+		clusterData, err = z.decompressZstdPooled(compressedData)
 		if err != nil {
-			return nil, fmt.Errorf("failed to create zstd reader: %w", err)
-		}
-		defer decoder.Close()
-		clusterData, err = io.ReadAll(decoder)
-		if err != nil {
-			return nil, fmt.Errorf("failed to decompress zstd cluster: %w", err)
+			return nil, err
 		}
 	default:
 		return nil, fmt.Errorf("unsupported compression type: %d", compression)
 	}
 
-	// Parse blob offsets (4 bytes each)
-	offsetReader := bytes.NewReader(clusterData)
+	// Release compressed data immediately
+	compressedData = nil
 
-	// Read first offset to determine number of blobs
-	var firstOffset uint32
-	if err := binary.Read(offsetReader, binary.LittleEndian, &firstOffset); err != nil {
-		return nil, err
-	}
+	// Cache the decompressed cluster
+	z.clusterCache.put(clusterNum, clusterData)
+	//log.Printf("Cached cluster %d: %d bytes decompressed", clusterNum, len(clusterData))
 
-	numBlobs := firstOffset / 4
-	if blobNum >= numBlobs {
-		return nil, fmt.Errorf("blob index %d out of range (max %d)", blobNum, numBlobs-1)
-	}
-
-	offsets := make([]uint32, numBlobs+1)
-	offsets[0] = firstOffset
-
-	for i := uint32(1); i <= numBlobs; i++ {
-		if i == numBlobs {
-			offsets[i] = uint32(len(clusterData))
-		} else {
-			if err := binary.Read(offsetReader, binary.LittleEndian, &offsets[i]); err != nil {
-				return nil, err
-			}
-		}
-	}
-
-	blobStart := offsets[blobNum]
-	blobEnd := offsets[blobNum+1]
-
-	if blobStart > uint32(len(clusterData)) || blobEnd > uint32(len(clusterData)) {
-		return nil, errors.New("blob offset out of range")
-	}
-
-	return clusterData[blobStart:blobEnd], nil
+	// Extract the requested blob
+	return z.extractBlobFromCluster(clusterData, blobNum)
 }
 
 // GetArticleContent retrieves the content of an article by its index
@@ -461,4 +536,76 @@ func compareNamespaceURL(ns1 byte, url1 string, ns2 byte, url2 string) int {
 		return 1
 	}
 	return strings.Compare(url1, url2)
+}
+
+// decompressZstdPooled uses a pooled decoder for memory-efficient decompression
+func (z *ZIMReader) decompressZstdPooled(compressedData []byte) ([]byte, error) {
+	decoderInterface := zstdDecoderPool.Get()
+	if decoderInterface == nil {
+		// Fallback: create new decoder
+		log.Println("Warning: failed to get pooled zstd decoder, creating new one")
+		decoder, err := zstd.NewReader(bytes.NewReader(compressedData), zstd.WithDecoderConcurrency(1), zstd.WithDecoderLowmem(true))
+		if err != nil {
+			return nil, fmt.Errorf("failed to create zstd reader: %w", err)
+		}
+		defer decoder.Close()
+		return io.ReadAll(decoder)
+	}
+
+	decoder := decoderInterface.(*zstd.Decoder)
+	err := decoder.Reset(bytes.NewReader(compressedData))
+	if err != nil {
+		zstdDecoderPool.Put(decoder)
+		return nil, fmt.Errorf("failed to reset zstd decoder: %w", err)
+	}
+
+	data, err := io.ReadAll(decoder)
+	zstdDecoderPool.Put(decoder)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decompress zstd cluster: %w", err)
+	}
+	return data, nil
+}
+
+// extractBlobFromCluster extracts a specific blob from decompressed cluster data
+func (z *ZIMReader) extractBlobFromCluster(clusterData []byte, blobNum uint32) ([]byte, error) {
+	if len(clusterData) < 4 {
+		return nil, errors.New("cluster data too small")
+	}
+
+	// Parse blob offsets (4 bytes each)
+	offsetReader := bytes.NewReader(clusterData)
+
+	// Read first offset to determine number of blobs
+	var firstOffset uint32
+	if err := binary.Read(offsetReader, binary.LittleEndian, &firstOffset); err != nil {
+		return nil, err
+	}
+
+	numBlobs := firstOffset / 4
+	if blobNum >= numBlobs {
+		return nil, fmt.Errorf("blob index %d out of range (max %d)", blobNum, numBlobs-1)
+	}
+
+	offsets := make([]uint32, numBlobs+1)
+	offsets[0] = firstOffset
+
+	for i := uint32(1); i <= numBlobs; i++ {
+		if i == numBlobs {
+			offsets[i] = uint32(len(clusterData))
+		} else {
+			if err := binary.Read(offsetReader, binary.LittleEndian, &offsets[i]); err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	blobStart := offsets[blobNum]
+	blobEnd := offsets[blobNum+1]
+
+	if blobStart > uint32(len(clusterData)) || blobEnd > uint32(len(clusterData)) {
+		return nil, errors.New("blob offset out of range")
+	}
+
+	return clusterData[blobStart:blobEnd], nil
 }

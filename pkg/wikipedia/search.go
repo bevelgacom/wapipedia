@@ -5,6 +5,7 @@ import (
 	cryptorand "crypto/rand"
 	"encoding/binary"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -18,8 +19,11 @@ import (
 
 // BlugeIndex handles the persistent search index
 type BlugeIndex struct {
-	reader *bluge.Reader
-	path   string
+	reader    *bluge.Reader
+	path      string
+	docCount  uint64 // Cached document count
+	docCached bool   // Whether doc count has been cached
+	cacheMu   sync.RWMutex
 }
 
 // DefaultIndexPath returns the default index path for a ZIM file
@@ -258,14 +262,19 @@ func (b *BlugeIndex) Search(query string, maxResults int) ([]SearchResult, error
 		return nil, nil
 	}
 
+	log.Printf("Bluge search: query=%q, maxResults=%d", query, maxResults)
 	ctx := context.Background()
 
 	// Build a query that matches title field
 	// Use a boolean query with should clauses for flexible matching
 	queryLower := strings.ToLower(query)
 
-	// Create multiple queries for different matching strategies
-	var queries []bluge.Query
+	// Pre-allocate queries slice to avoid reallocations
+	queryCapacity := 5
+	if len(query) <= 3 {
+		queryCapacity = 4 // No fuzzy query for short queries
+	}
+	queries := make([]bluge.Query, 0, queryCapacity)
 
 	// 1. Exact title match (highest priority)
 	exactQuery := bluge.NewTermQuery(queryLower).SetField("title_exact").SetBoost(100.0)
@@ -279,7 +288,7 @@ func (b *BlugeIndex) Search(query string, maxResults int) ([]SearchResult, error
 	matchQuery := bluge.NewMatchQuery(query).SetField("title").SetBoost(10.0)
 	queries = append(queries, matchQuery)
 
-	// 4. Fuzzy match for typo tolerance
+	// 4. Fuzzy match for typo tolerance (skip for short queries - expensive)
 	if len(query) > 3 {
 		fuzzyQuery := bluge.NewFuzzyQuery(queryLower).SetField("title_exact").SetFuzziness(1).SetBoost(5.0)
 		queries = append(queries, fuzzyQuery)
@@ -300,10 +309,12 @@ func (b *BlugeIndex) Search(query string, maxResults int) ([]SearchResult, error
 	searchReq := bluge.NewTopNSearch(maxResults, boolQuery).WithStandardAggregations()
 	docMatches, err := b.reader.Search(ctx, searchReq)
 	if err != nil {
+		log.Printf("Bluge search error: %v", err)
 		return nil, fmt.Errorf("search failed: %w", err)
 	}
 
-	var results []SearchResult
+	// Pre-allocate results slice
+	results := make([]SearchResult, 0, maxResults)
 
 	// Iterate through results
 	match, err := docMatches.Next()
@@ -340,14 +351,35 @@ func (b *BlugeIndex) Search(query string, maxResults int) ([]SearchResult, error
 	}
 
 	if err != nil {
+		log.Printf("Bluge search iteration error: %v", err)
 		return nil, fmt.Errorf("error iterating results: %w", err)
 	}
 
+	log.Printf("Bluge search complete: %d results for %q", len(results), query)
 	return results, nil
 }
 
-// GetDocumentCount returns the number of documents in the index
+// GetDocumentCount returns the number of documents in the index (cached after first call)
 func (b *BlugeIndex) GetDocumentCount() (uint64, error) {
+	// Check cache first
+	b.cacheMu.RLock()
+	if b.docCached {
+		count := b.docCount
+		b.cacheMu.RUnlock()
+		return count, nil
+	}
+	b.cacheMu.RUnlock()
+
+	// Need to compute
+	b.cacheMu.Lock()
+	defer b.cacheMu.Unlock()
+
+	// Double-check after acquiring write lock
+	if b.docCached {
+		return b.docCount, nil
+	}
+
+	log.Println("Computing document count for search index...")
 	ctx := context.Background()
 
 	// Use a match all query with count aggregation
@@ -359,14 +391,18 @@ func (b *BlugeIndex) GetDocumentCount() (uint64, error) {
 		return 0, err
 	}
 
-	return docMatches.Aggregations().Count(), nil
+	count := docMatches.Aggregations().Count()
+	b.docCount = count
+	b.docCached = true
+	log.Printf("Document count: %d (cached)", count)
+	return count, nil
 }
 
 // GetRandomArticleIndex returns a random article index from the search index
 func (b *BlugeIndex) GetRandomArticleIndex() (uint32, error) {
 	ctx := context.Background()
 
-	// Get total document count
+	// Get total document count (cached if available)
 	count, err := b.GetDocumentCount()
 	if err != nil {
 		return 0, fmt.Errorf("failed to get document count: %w", err)
@@ -382,8 +418,11 @@ func (b *BlugeIndex) GetRandomArticleIndex() (uint32, error) {
 	}
 	offset := int(binary.LittleEndian.Uint64(buf[:]) % count)
 
-	// Use match all query with the random offset
+	// Use match all query with a small result set - skip to offset efficiently
+	// Only fetch the single document we need
 	query := bluge.NewMatchAllQuery()
+
+	// Limit search to just what we need (offset + 1)
 	searchReq := bluge.NewTopNSearch(offset+1, query)
 
 	docMatches, err := b.reader.Search(ctx, searchReq)
@@ -391,32 +430,34 @@ func (b *BlugeIndex) GetRandomArticleIndex() (uint32, error) {
 		return 0, fmt.Errorf("search failed: %w", err)
 	}
 
-	// Skip to the random offset and get the match at that position
-	docMatch, err := docMatches.Next()
-	for i := 0; i < offset && err == nil && docMatch != nil; i++ {
-		docMatch, err = docMatches.Next()
+	// Skip to the random offset - iterate until we reach target
+	var docMatch, matchErr = docMatches.Next()
+	for i := 0; i < offset && matchErr == nil && docMatch != nil; i++ {
+		docMatch, matchErr = docMatches.Next()
 	}
-	if err != nil {
-		return 0, fmt.Errorf("error iterating to offset: %w", err)
+	if matchErr != nil {
+		return 0, fmt.Errorf("error iterating to offset: %w", matchErr)
 	}
 	if docMatch == nil {
 		return 0, fmt.Errorf("unexpected end of results at offset %d", offset)
 	}
 
-	// Extract the article index from the match
+	// Extract the article index from the final match
 	var articleIdx uint32
 	var found bool
 	err = docMatch.VisitStoredFields(func(field string, value []byte) bool {
 		if field == "idx" {
-			if num, err := bluge.DecodeNumericFloat64(value); err == nil {
+			if num, decErr := bluge.DecodeNumericFloat64(value); decErr == nil {
 				articleIdx = uint32(num)
 				found = true
+				return false // Stop visiting fields once we found idx
 			}
 		} else if field == "_id" && !found {
 			// Fallback: document ID is the index as string
-			if idx, err := strconv.ParseUint(string(value), 10, 32); err == nil {
+			if idx, parseErr := strconv.ParseUint(string(value), 10, 32); parseErr == nil {
 				articleIdx = uint32(idx)
 				found = true
+				return false
 			}
 		}
 		return true
