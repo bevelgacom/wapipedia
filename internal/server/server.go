@@ -9,10 +9,13 @@ import (
 	"strings"
 	"sync"
 	"text/template"
+	"time"
 
 	image "github.com/bevelgacom/wapipedia/pkg/wbmp"
 	"github.com/bevelgacom/wapipedia/pkg/wikipedia"
 	"github.com/labstack/echo/v4"
+	"github.com/labstack/echo/v4/middleware"
+	"golang.org/x/time/rate"
 )
 
 // Global Wikipedia instance
@@ -438,6 +441,29 @@ func serveWikiImage(c echo.Context) error {
 
 // RegisterWikiRoutes registers all Wikipedia-related routes
 func RegisterWikiRoutes(e *echo.Echo) {
+	// Add rate limiting middleware to prevent server overload
+	// Allows 5 requests per second with a burst of 10 globally
+	config := middleware.RateLimiterConfig{
+		Skipper: middleware.DefaultSkipper,
+		Store: middleware.NewRateLimiterMemoryStoreWithConfig(
+			middleware.RateLimiterMemoryStoreConfig{
+				Rate:      rate.Limit(5), // 5 requests per second
+				Burst:     10,            // Allow bursts up to 10 requests
+				ExpiresIn: 3 * time.Minute,
+			},
+		),
+		IdentifierExtractor: func(ctx echo.Context) (string, error) {
+			return "1", nil // no IP-based limiting, most of it comes from Kannel anyway
+		},
+		ErrorHandler: func(context echo.Context, err error) error {
+			return context.String(http.StatusForbidden, "Rate limit error")
+		},
+		DenyHandler: func(context echo.Context, identifier string, err error) error {
+			return context.String(http.StatusTooManyRequests, "Whelp we are a bit overloaded. Please try again later.")
+		},
+	}
+	e.Use(middleware.RateLimiterWithConfig(config))
+
 	e.GET("/", serveWikiHome)
 	e.GET("/search", serveWikiSearch)
 	e.GET("/article", serveWikiArticle)
