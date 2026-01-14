@@ -18,7 +18,7 @@ var (
 var serveCmd = &cobra.Command{
 	Use:   "serve",
 	Short: "Start the WAP server",
-	Long: `Start the Wapipedia WAP server to serve Wikipedia content
+	Long: `Start the WAPipedia WAP server to serve Wikipedia content
 to legacy mobile devices.`,
 	Example: `  wapipedia serve
   wapipedia serve -zim ./data/wikipedia.zim -port 8080`,
@@ -63,7 +63,7 @@ func runServe() {
 	// Wikipedia routes
 	server.RegisterWikiRoutes(e)
 
-	log.Printf("Starting Wapipedia server on port %s...", port)
+	log.Printf("Starting WAPipedia server on port %s...", port)
 	if err := e.Start(":" + port); err != nil && err != http.ErrServerClosed {
 		log.Fatal(err)
 	}

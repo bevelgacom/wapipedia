@@ -9,8 +9,8 @@ import (
 
 var rootCmd = &cobra.Command{
 	Use:   "wapipedia",
-	Short: "Wapipedia - Wikipedia for WAP devices",
-	Long: `Wapipedia is a lightweight Wikipedia server designed for WAP devices.
+	Short: "WAPipedia - Wikipedia for WAP devices",
+	Long: `WAPipedia is a lightweight Wikipedia server designed for WAP devices.
 It serves Wikipedia content from ZIM files in WML format`,
 	Run: func(cmd *cobra.Command, args []string) {
 		// Default to serve command when no subcommand is provided

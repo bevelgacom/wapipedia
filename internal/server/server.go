@@ -368,11 +368,11 @@ func RegisterWikiRoutes(e *echo.Echo) {
 	e.GET("/infobox", serveWikiInfobox)
 	e.GET("/random", serveWikiRandom)
 	e.GET("/image/*", serveWikiImage)
-	e.GET("/wapipedia.wbmp", serveWapipediaLogo)
+	e.GET("/wapipedia.wbmp", serveWAPipediaLogo)
 }
 
-// serveWapipediaLogo serves the Wapipedia logo WBMP file
-func serveWapipediaLogo(c echo.Context) error {
+// serveWAPipediaLogo serves the WAPipedia logo WBMP file
+func serveWAPipediaLogo(c echo.Context) error {
 	return c.File("./wapipedia.wbmp")
 }
 

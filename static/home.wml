@@ -2,9 +2,9 @@
 <!DOCTYPE wml PUBLIC "-//WAPFORUM//DTD WML 1.1//EN" "http://www.wapforum.org/DTD/wml_1.1.xml">
 
 <wml>
-<card id="home" title="Wapipedia">
+<card id="home" title="WAPipedia">
 <p align="center">
-<img src="/wapipedia.wbmp" alt="Wapipedia"/><br/>
+<img src="/wapipedia.wbmp" alt="WAPipedia"/><br/>
 Wikipedia for WAP
 </p>
 
@@ -28,7 +28,7 @@ Search
 </p>
 
 <p>
-<small><i>Wikipedia is available under the Creative Commons Attribution-ShareAlike 4.0 License; Wikipedia is a registered trademark of the Wikimedia Foundation, Inc., a non-profit organization. Wapipedia is a hobby project by Bevelgacom a Retro ISP and is not affiliated with the Wikimedia Foundation.</i></small>
+<small><i>Wikipedia is available under the Creative Commons Attribution-ShareAlike 4.0 License; Wikipedia is a registered trademark of the Wikimedia Foundation, Inc., a non-profit organization. WAPipedia is a hobby project by Bevelgacom a Retro ISP and is not affiliated with the Wikimedia Foundation.</i></small>
 </p>
 
 </card>

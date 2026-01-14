@@ -1,8 +1,8 @@
-# Wapipedia
+# WAPipedia
 
 **Wikipedia for WAP devices** - Access Wikipedia content on WAP-enabled mobile phones.
 
-Wapipedia is a server that uses Wikipedia ZIM files to serve articles in WML format, making them accessible on WAP 1.0 devices. Bridging the knowledge gap to old mobile devices and very low bandwidth connections.
+WAPipedia is a server that uses Wikipedia ZIM files to serve articles in WML format, making them accessible on WAP 1.0 devices. Bridging the knowledge gap to old mobile devices and very low bandwidth connections.
 
 This project is part of [Bevelgacom](https://github.com/bevelgacom) a Retro ISP focussed on re-building the WPA internet.
 
@@ -28,7 +28,7 @@ First, download a Wikipedia dump. For testing, use the "top100" dump (~313MB):
 ./wapipedia serve --zim ./data/wikipedia_en_100_2025-10-01.zim -port 8080
 ```
 
-### 3. Access Wapipedia
+### 3. Access WAPipedia
 
 Open your WAP browser and navigate to:
 ```
