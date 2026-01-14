@@ -22,7 +22,7 @@ import (
 var wiki *wikipedia.Wikipedia
 
 // Random ID cache
-const randomIDCacheSize = 100
+const randomIDCacheSize = 50
 
 var (
 	randomIDCache  []uint32
