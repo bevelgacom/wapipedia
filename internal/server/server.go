@@ -368,6 +368,12 @@ func RegisterWikiRoutes(e *echo.Echo) {
 	e.GET("/infobox", serveWikiInfobox)
 	e.GET("/random", serveWikiRandom)
 	e.GET("/image/*", serveWikiImage)
+	e.GET("/wapipedia.wbmp", serveWapipediaLogo)
+}
+
+// serveWapipediaLogo serves the Wapipedia logo WBMP file
+func serveWapipediaLogo(c echo.Context) error {
+	return c.File("./wapipedia.wbmp")
 }
 
 // GetZIMPath returns the path to the ZIM file from environment or default
