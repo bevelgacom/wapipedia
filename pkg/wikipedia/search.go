@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"log"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -19,11 +20,15 @@ import (
 
 // BlugeIndex handles the persistent search index
 type BlugeIndex struct {
-	reader    *bluge.Reader
-	path      string
-	docCount  uint64 // Cached document count
-	docCached bool   // Whether doc count has been cached
-	cacheMu   sync.RWMutex
+	reader     *bluge.Reader
+	path       string
+	docCount   uint64 // Cached document count
+	docCached  bool   // Whether doc count has been cached
+	cacheMu    sync.RWMutex
+	randomPool []uint32 // Pre-sampled pool of random article IDs
+	poolMu     sync.Mutex
+	poolIdx    int          // Current position in random pool
+	poolReady  chan struct{} // Closed when pool is ready
 }
 
 // DefaultIndexPath returns the default index path for a ZIM file
@@ -229,6 +234,9 @@ func BuildBlugeIndex(zimPath, indexPath string) error {
 	return nil
 }
 
+// randomPoolSize is the number of random article IDs to pre-sample
+const randomPoolSize = 10000
+
 // LoadBlugeIndex loads an existing Bluge index
 func LoadBlugeIndex(indexPath string) (*BlugeIndex, error) {
 	if _, err := os.Stat(indexPath); os.IsNotExist(err) {
@@ -241,10 +249,106 @@ func LoadBlugeIndex(indexPath string) (*BlugeIndex, error) {
 		return nil, fmt.Errorf("failed to open index: %w", err)
 	}
 
-	return &BlugeIndex{
-		reader: reader,
-		path:   indexPath,
-	}, nil
+	idx := &BlugeIndex{
+		reader:     reader,
+		path:       indexPath,
+		randomPool: make([]uint32, 0, randomPoolSize),
+		poolReady:  make(chan struct{}),
+	}
+
+	// Pre-populate the random pool in background
+	go idx.fillRandomPool()
+
+	return idx, nil
+}
+
+// fillRandomPool uses reservoir sampling to collect random article IDs
+func (b *BlugeIndex) fillRandomPool() {
+	log.Println("Building random article pool using reservoir sampling...")
+	ctx := context.Background()
+
+	// Seed RNG
+	var buf [8]byte
+	if _, err := cryptorand.Read(buf[:]); err != nil {
+		log.Printf("Failed to seed RNG for random pool: %v", err)
+		return
+	}
+	rng := rand.New(rand.NewSource(int64(binary.LittleEndian.Uint64(buf[:]))))
+
+	// Stream through all documents with reservoir sampling
+	query := bluge.NewMatchAllQuery()
+	searchReq := bluge.NewAllMatches(query)
+
+	docMatches, err := b.reader.Search(ctx, searchReq)
+	if err != nil {
+		log.Printf("Failed to search for random pool: %v", err)
+		return
+	}
+
+	reservoir := make([]uint32, 0, randomPoolSize)
+	n := 0
+
+	for {
+		docMatch, err := docMatches.Next()
+		if err != nil {
+			log.Printf("Error iterating for random pool: %v", err)
+			break
+		}
+		if docMatch == nil {
+			break
+		}
+
+		// Extract article index
+		var articleIdx uint32
+		var found bool
+		_ = docMatch.VisitStoredFields(func(field string, value []byte) bool {
+			if field == "idx" {
+				if num, decErr := bluge.DecodeNumericFloat64(value); decErr == nil {
+					articleIdx = uint32(num)
+					found = true
+					return false
+				}
+			} else if field == "_id" && !found {
+				if idx, parseErr := strconv.ParseUint(string(value), 10, 32); parseErr == nil {
+					articleIdx = uint32(idx)
+					found = true
+					return false
+				}
+			}
+			return true
+		})
+
+		if !found {
+			continue
+		}
+
+		n++
+		if len(reservoir) < randomPoolSize {
+			// Fill reservoir until full
+			reservoir = append(reservoir, articleIdx)
+		} else {
+			// Reservoir sampling: replace with probability k/n
+			j := rng.Intn(n)
+			if j < randomPoolSize {
+				reservoir[j] = articleIdx
+			}
+		}
+	}
+
+	// Shuffle the reservoir for better distribution when consuming
+	rng.Shuffle(len(reservoir), func(i, j int) {
+		reservoir[i], reservoir[j] = reservoir[j], reservoir[i]
+	})
+
+	b.poolMu.Lock()
+	b.randomPool = reservoir
+	b.poolIdx = 0
+	b.poolMu.Unlock()
+
+	// Signal that pool is ready
+	close(b.poolReady)
+
+	log.Printf("Random article pool ready: %d articles sampled", len(reservoir))
 }
 
 // Close closes the Bluge index reader
@@ -399,75 +503,33 @@ func (b *BlugeIndex) GetDocumentCount() (uint64, error) {
 }
 
 // GetRandomArticleIndex returns a random article index from the search index
+// Uses pre-sampled pool for O(1) performance
 func (b *BlugeIndex) GetRandomArticleIndex() (uint32, error) {
-	ctx := context.Background()
+	// Wait for pool to be ready (blocks on first calls until reservoir sampling completes)
+	<-b.poolReady
 
-	// Get total document count (cached if available)
-	count, err := b.GetDocumentCount()
-	if err != nil {
-		return 0, fmt.Errorf("failed to get document count: %w", err)
-	}
-	if count == 0 {
-		return 0, fmt.Errorf("no articles in index")
-	}
+	b.poolMu.Lock()
+	defer b.poolMu.Unlock()
 
-	// Pick a random offset using crypto/rand (no seeding required)
-	var buf [8]byte
-	if _, err := cryptorand.Read(buf[:]); err != nil {
-		return 0, fmt.Errorf("failed to generate random number: %w", err)
-	}
-	offset := int(binary.LittleEndian.Uint64(buf[:]) % count)
-
-	// Use match all query with a small result set - skip to offset efficiently
-	// Only fetch the single document we need
-	query := bluge.NewMatchAllQuery()
-
-	// Limit search to just what we need (offset + 1)
-	searchReq := bluge.NewTopNSearch(offset+1, query)
-
-	docMatches, err := b.reader.Search(ctx, searchReq)
-	if err != nil {
-		return 0, fmt.Errorf("search failed: %w", err)
+	if len(b.randomPool) == 0 {
+		return 0, fmt.Errorf("random pool is empty")
 	}
 
-	// Skip to the random offset - iterate until we reach target
-	var docMatch, matchErr = docMatches.Next()
-	for i := 0; i < offset && matchErr == nil && docMatch != nil; i++ {
-		docMatch, matchErr = docMatches.Next()
-	}
-	if matchErr != nil {
-		return 0, fmt.Errorf("error iterating to offset: %w", matchErr)
-	}
-	if docMatch == nil {
-		return 0, fmt.Errorf("unexpected end of results at offset %d", offset)
-	}
+	// Get next article from pool (round-robin with shuffle)
+	idx := b.randomPool[b.poolIdx]
+	b.poolIdx++
 
-	// Extract the article index from the final match
-	var articleIdx uint32
-	var found bool
-	err = docMatch.VisitStoredFields(func(field string, value []byte) bool {
-		if field == "idx" {
-			if num, decErr := bluge.DecodeNumericFloat64(value); decErr == nil {
-				articleIdx = uint32(num)
-				found = true
-				return false // Stop visiting fields once we found idx
-			}
-		} else if field == "_id" && !found {
-			// Fallback: document ID is the index as string
-			if idx, parseErr := strconv.ParseUint(string(value), 10, 32); parseErr == nil {
-				articleIdx = uint32(idx)
-				found = true
-				return false
-			}
+	// When we've used all IDs, reshuffle and start over
+	if b.poolIdx >= len(b.randomPool) {
+		var buf [8]byte
+		if _, err := cryptorand.Read(buf[:]); err == nil {
+			rng := rand.New(rand.NewSource(int64(binary.LittleEndian.Uint64(buf[:]))))
+			rng.Shuffle(len(b.randomPool), func(i, j int) {
+				b.randomPool[i], b.randomPool[j] = b.randomPool[j], b.randomPool[i]
+			})
 		}
-		return true
-	})
-	if err != nil {
-		return 0, fmt.Errorf("error reading stored fields: %w", err)
-	}
-	if !found {
-		return 0, fmt.Errorf("article index not found in document")
+		b.poolIdx = 0
 	}
 
-	return articleIdx, nil
+	return idx, nil
 }

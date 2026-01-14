@@ -83,7 +83,7 @@ func (c *clusterCache) put(clusterNum uint32, data []byte) {
 		oldest := c.order[0]
 		c.order = c.order[1:]
 		delete(c.entries, oldest)
-		log.Printf("Evicted cluster %d from cache", oldest)
+		//log.Printf("Evicted cluster %d from cache", oldest)
 	}
 
 	c.entries[clusterNum] = &clusterCacheEntry{data: data}
@@ -248,6 +248,17 @@ func (z *ZIMReader) readMimeTypes() error {
 	}
 
 	return nil
+}
+
+// GetMIMEType returns the MIME type string for a given index
+func (z *ZIMReader) GetMIMEType(idx uint16) string {
+	z.mu.Lock()
+	defer z.mu.Unlock()
+
+	if int(idx) < len(z.mimeTypes) {
+		return z.mimeTypes[idx]
+	}
+	return ""
 }
 
 func (z *ZIMReader) readURLPointers() error {
