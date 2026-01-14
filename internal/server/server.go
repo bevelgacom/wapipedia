@@ -450,7 +450,7 @@ func RegisterWikiRoutes(e *echo.Echo) {
 // serveWAPipediaLogo serves the WAPipedia logo WBMP file
 func serveWAPipediaLogo(c echo.Context) error {
 	c.Response().Header().Set(echo.HeaderContentType, "image/vnd.wap.wbmp")
-	return c.File("./wapipedia.wbmp")
+	return c.File("./static/wapipedia.wbmp")
 }
 
 // GetZIMPath returns the path to the ZIM file from environment or default
