@@ -21,6 +21,7 @@ WORKDIR /opt/wapipedia
 RUN mkdir /data
 
 COPY --from=build /go/src/github.com/bevelgacom/wapipedia/wapipedia /usr/local/bin
+COPY /static /opt/wapipedia/static
 
 # Default ZIM path
 ENV WAPIPEDIA_ZIM=/data/wikipedia.zim
