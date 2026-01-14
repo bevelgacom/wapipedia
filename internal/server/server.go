@@ -89,32 +89,42 @@ func InitWikipedia(zimPath string) error {
 
 // initRandomIDCache initializes the random ID cache and starts the background refill goroutine
 func initRandomIDCache() {
+	log.Printf("Initializing random ID cache with size %d", randomIDCacheSize)
 	randomIDCache = make([]uint32, 0, randomIDCacheSize)
 	randomIDRefill = make(chan struct{}, randomIDCacheSize)
 
 	// Pre-fill the cache
+	log.Println("Starting initial random ID cache fill")
 	go fillRandomIDCache(randomIDCacheSize)
 
 	// Start background refill goroutine
+	log.Println("Starting random ID refill worker")
 	go randomIDRefillWorker()
 }
 
 // fillRandomIDCache fills the cache with random article IDs
 func fillRandomIDCache(count int) {
+	log.Printf("Filling random ID cache with %d entries", count)
+	filled := 0
 	for i := 0; i < count; i++ {
 		if article, err := wiki.GetRandomArticle(); err == nil {
 			randomIDMutex.Lock()
-			if len(randomIDCache) < randomIDCacheSize {
-				randomIDCache = append(randomIDCache, article.Index)
-			}
+			randomIDCache = append(randomIDCache, article.Index)
+			filled++
+			log.Printf("Added random article ID %d to cache, new size: %d", article.Index, len(randomIDCache))
 			randomIDMutex.Unlock()
+		} else {
+			log.Printf("Error getting random article for cache: %v", err)
 		}
 	}
+	log.Printf("Filled %d random IDs, cache size now: %d", filled, len(randomIDCache))
 }
 
 // randomIDRefillWorker is a background goroutine that refills the cache when signaled
 func randomIDRefillWorker() {
+	log.Println("Random ID refill worker started")
 	for range randomIDRefill {
+		log.Printf("Refill signal received, cache size: %d", len(randomIDCache))
 		fillRandomIDCache(1)
 	}
 }
@@ -125,18 +135,22 @@ func getRandomIDFromCache() (uint32, bool) {
 	defer randomIDMutex.Unlock()
 
 	if len(randomIDCache) == 0 {
+		log.Println("Random ID cache is empty")
 		return 0, false
 	}
 
 	// Pop the last ID from the cache
 	id := randomIDCache[len(randomIDCache)-1]
 	randomIDCache = randomIDCache[:len(randomIDCache)-1]
+	log.Printf("Got random ID %d from cache, remaining: %d", id, len(randomIDCache))
 
 	// Signal the refill goroutine (non-blocking)
 	select {
 	case randomIDRefill <- struct{}{}:
+		log.Println("Signaled refill worker")
 	default:
 		// Channel is full, refill already pending
+		log.Println("Refill channel full, skipping signal")
 	}
 
 	return id, true
@@ -144,7 +158,9 @@ func getRandomIDFromCache() (uint32, bool) {
 
 // serveWikiHome serves the Wikipedia home page
 func serveWikiHome(c echo.Context) error {
+	log.Printf("Serving home page, User-Agent: %s", c.Request().UserAgent())
 	if wiki == nil {
+		log.Println("Wiki not initialized, returning error")
 		return serveWikiError(c, "Not Available", "Wikipedia data is not loaded. Please download a Wikipedia dump first.")
 	}
 
@@ -154,6 +170,7 @@ func serveWikiHome(c echo.Context) error {
 		randomID = id
 	} else if article, err := wiki.GetRandomArticle(); err == nil {
 		// Fallback if cache is empty
+		log.Printf("Cache miss, fetched random article %d directly", article.Index)
 		randomID = article.Index
 	}
 
@@ -169,11 +186,14 @@ func serveWikiHome(c echo.Context) error {
 // serveWikiSearch serves search results
 func serveWikiSearch(c echo.Context) error {
 	if wiki == nil {
+		log.Println("Search request but wiki not initialized")
 		return serveWikiError(c, "Not Available", "Wikipedia data is not loaded.")
 	}
 
 	query := c.QueryParam("q")
+	log.Printf("Search request: q=%q, User-Agent: %s", query, c.Request().UserAgent())
 	if query == "" {
+		log.Println("Empty search query, redirecting to home")
 		return c.Redirect(http.StatusFound, "/")
 	}
 
@@ -187,11 +207,13 @@ func serveWikiSearch(c echo.Context) error {
 	}
 
 	maxResults := 10
+	log.Printf("Searching for %q with offset %d", query, offset)
 	results, err := wiki.Search(query, maxResults+offset+1)
 	if err != nil {
-		log.Printf("Search error: %v", err)
+		log.Printf("Search error for %q: %v", query, err)
 		return serveWikiError(c, "Search Error", "An error occurred while searching.")
 	}
+	log.Printf("Search for %q returned %d results", query, len(results))
 
 	// Apply offset and limit
 	showMore := false
@@ -226,12 +248,15 @@ func serveWikiSearch(c echo.Context) error {
 
 // serveWikiArticle serves an article
 func serveWikiArticle(c echo.Context) error {
+	log.Printf("Article request: id=%s, p=%s, User-Agent: %s", c.QueryParam("id"), c.QueryParam("p"), c.Request().UserAgent())
 	if wiki == nil {
+		log.Println("Article request but wiki not initialized")
 		return serveWikiError(c, "Not Available", "Wikipedia data is not loaded.")
 	}
 
 	idStr := c.QueryParam("id")
 	if idStr == "" {
+		log.Println("Article request with no ID")
 		return serveWikiError(c, "Invalid Request", "No article ID specified.")
 	}
 
@@ -250,11 +275,13 @@ func serveWikiArticle(c echo.Context) error {
 
 	// Get render options based on device capabilities
 	opts := getRenderOptions(c)
+	log.Printf("Fetching article %d with options: SupportsTables=%v", id, opts.SupportsTables)
 	article, err := wiki.GetArticleWithOptions(uint32(id), opts)
 	if err != nil {
 		log.Printf("Error getting article %d: %v", id, err)
 		return serveWikiError(c, "Article Not Found", "The requested article could not be found.")
 	}
+	log.Printf("Serving article %d: %q, page %d", id, article.Title, page)
 
 	// Check if article has an infobox (only show link on first page for non-Nokia 7110)
 	hasInfobox := false
@@ -395,13 +422,16 @@ func serveWikiError(c echo.Context, title, message string) error {
 
 // serveWikiImage serves images from the ZIM file in JPEG or WBMP format
 func serveWikiImage(c echo.Context) error {
+	log.Printf("Image request: %s, Accept: %s", c.Param("*"), c.Request().Header.Get("Accept"))
 	if wiki == nil {
+		log.Println("Image request but wiki not initialized")
 		return c.String(http.StatusServiceUnavailable, "Wikipedia data is not loaded.")
 	}
 
 	// Get image path from the URL parameter
 	imagePath := c.Param("*")
 	if imagePath == "" {
+		log.Println("Image request with no path")
 		return c.String(http.StatusBadRequest, "No image path specified.")
 	}
 
@@ -426,10 +456,12 @@ func serveWikiImage(c echo.Context) error {
 	accept := c.Request().Header.Get("Accept")
 
 	if strings.Contains(accept, "image/jpeg") {
+		log.Printf("Serving image %s as JPEG", imagePath)
 		return c.Blob(http.StatusOK, "image/jpeg", image.ImageToJPEG(content, 80))
 	}
 
 	// Default to WBMP for WAP devices
+	log.Printf("Serving image %s as WBMP", imagePath)
 	return c.Blob(http.StatusOK, "image/vnd.wap.wbmp", image.ImageToWBMP(content, 80))
 }
 
