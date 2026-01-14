@@ -115,13 +115,7 @@ func fillRandomIDCache(count int) {
 // randomIDRefillWorker is a background goroutine that refills the cache when signaled
 func randomIDRefillWorker() {
 	for range randomIDRefill {
-		randomIDMutex.Lock()
-		needCount := randomIDCacheSize - len(randomIDCache)
-		randomIDMutex.Unlock()
-
-		if needCount > 0 {
-			fillRandomIDCache(needCount)
-		}
+		fillRandomIDCache(1)
 	}
 }
 
