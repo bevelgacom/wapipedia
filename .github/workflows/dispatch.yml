@@ -68,5 +68,5 @@ jobs:
         docker kill wapipedia || true
         docker rm wapipedia || true
         docker pull ghcr.io/${{ github.repository }}/wapipedia:$GITHUB_SHA
-        docker run -d --restart=always --name wapipedia -v /mnt/wapipedia:/data -p 8040:8080 ghcr.io/${{ github.repository }}/wapipedia:$GITHUB_SHA
+        docker run -d --restart=always --name wapipedia --cpus=3 -v /mnt/wapipedia:/data -p 8040:8080 ghcr.io/${{ github.repository }}/wapipedia:$GITHUB_SHA
         docker system prune -f -a
